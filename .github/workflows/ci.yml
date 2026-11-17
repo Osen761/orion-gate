@@ -1,0 +1,74 @@
+name: Orion Gate CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test-and-boundary:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package in editable mode
+        run: |
+          python -m pip install --upgrade pip build
+          pip install -e ".[dev]"
+
+      - name: Verify zero Cloud/proprietary imports or personal paths
+        run: |
+          python - <<'PY'
+          import ast
+          import re
+          from pathlib import Path
+
+          forbidden_prefixes = (
+              "app",
+              "alembic",
+              "langgraph",
+              "firebase_admin",
+              "supabase",
+              "python_sandbox",
+          )
+          personal_path_re = re.compile(r"(/home/[a-zA-Z0-9._-]+|/Users/[a-zA-Z0-9._-]+)")
+          violations = []
+          for root in (Path("orion_gate"), Path("tests")):
+              for path in sorted(root.rglob("*.py")):
+                  text = path.read_text(encoding="utf-8")
+                  if personal_path_re.search(text):
+                      violations.append(f"{path}: personal home path found")
+                  tree = ast.parse(text, filename=str(path))
+                  for node in ast.walk(tree):
+                      if isinstance(node, ast.Import):
+                          for alias in node.names:
+                              if alias.name == "app" or any(alias.name.startswith(p + ".") or alias.name == p for p in forbidden_prefixes):
+                                  violations.append(f"{path}:{node.lineno}: forbidden import {alias.name}")
+                      elif isinstance(node, ast.ImportFrom) and node.module:
+                          mod = node.module
+                          if mod == "app" or any(mod.startswith(p + ".") or mod == p for p in forbidden_prefixes):
+                              violations.append(f"{path}:{node.lineno}: forbidden from-import {mod}")
+          if violations:
+              raise SystemExit("\n".join(violations))
+          print("Boundary check passed: zero forbidden imports or personal paths.")
+          PY
+
+      - name: Run full test suite (unit + adversarial attacks)
+        run: |
+          python -m unittest discover -s tests -p "test_*.py" -v
+          python -m unittest discover -s tests/attacks -p "test_*.py" -v
+
+      - name: Smoke test CLI & wheel build
+        run: |
+          orion-gate validate --config orion.example.yaml
+          orion-gate check-sql --config orion.example.yaml --tenant org_acme --sql "SELECT id, email, amount FROM orders"
+          python -m build

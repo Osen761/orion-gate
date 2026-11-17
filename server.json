@@ -1,0 +1,70 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Osen761/orion-gate",
+  "title": "Orion Gate",
+  "description": "Zero-trust SQL AST & MCP firewall enforcing tenant isolation, PII scrubbing, and schema allowlists.",
+  "version": "0.4.0",
+  "websiteUrl": "https://github.com/Osen761/orion-gate",
+  "repository": {
+    "url": "https://github.com/Osen761/orion-gate",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "orion-gate",
+      "version": "0.4.0",
+      "transport": {
+        "type": "streamable-http",
+        "url": "http://localhost:8000/mcp",
+        "headers": [
+          {
+            "name": "Authorization",
+            "description": "Bearer token (ORION_LOCAL_TOKEN or scoped HS256 agent JWT)",
+            "isRequired": true,
+            "isSecret": true
+          }
+        ]
+      }
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://api.oriongate.dev/mcp",
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Orion API Key (ok_live_... / ok_test_...) or scoped JWT",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
+    }
+  ],
+  "environmentVariables": [
+    {
+      "name": "ORION_YAML_PATH",
+      "description": "Path to standalone orion.yaml policy file",
+      "isRequired": true
+    },
+    {
+      "name": "DATABASE_URL",
+      "description": "Read-only PostgreSQL, MySQL, or BigQuery connection URL",
+      "isRequired": false,
+      "isSecret": true
+    },
+    {
+      "name": "ORION_LOCAL_TOKEN",
+      "description": "Static bearer token for local or CI gateway authentication",
+      "isRequired": false,
+      "isSecret": true
+    },
+    {
+      "name": "ORION_JWT_SECRET",
+      "description": "HS256 signing secret for scoped per-tenant agent tokens",
+      "isRequired": false,
+      "isSecret": true
+    }
+  ]
+}

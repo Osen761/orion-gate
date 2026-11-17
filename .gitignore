@@ -1,0 +1,19 @@
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Packaging & builds
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments & local config
+.venv/
+venv/
+.env
+orion.yaml

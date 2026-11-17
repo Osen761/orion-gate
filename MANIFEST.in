@@ -1,0 +1,11 @@
+include LICENSE
+include README.md
+include SECURITY.md
+include ARCHITECTURE.md
+include ROADMAP.md
+include Dockerfile.gate
+include server.json
+include orion.example.yaml
+recursive-include benchmarks *.py
+recursive-include tests *.py
+global-exclude __pycache__ *.py[cod]

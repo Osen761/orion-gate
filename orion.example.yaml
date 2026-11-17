@@ -1,0 +1,66 @@
+version: "1.0"
+
+workspace:
+  id: "00000000-0000-0000-0000-000000000100"
+  name: "Acme SaaS Production"
+
+datasource:
+  id: "00000000-0000-0000-0000-000000000001"
+  name: "prod_postgres"
+  dialect: postgres # postgres | mysql | bigquery
+  url_env: DATABASE_URL
+
+policy:
+  allowed_tables:
+    - orders
+    - customers
+    - invoices
+  denied_tables:
+    - admin_audit_secrets
+    - audit_logs
+  allowed_columns:
+    orders:
+      - id
+      - org_id
+      - email
+      - amount
+      - status
+    customers:
+      - id
+      - org_id
+      - email
+      - phone
+    invoices:
+      - id
+      - org_id
+      - total_usd
+  denied_columns:
+    customers:
+      - password_hash
+      - ssn
+      - stripe_secret_key
+  pii_masking:
+    customers.email: redact_email
+    customers.phone: mask_phone
+    orders.email: redact_email
+  tenant_isolation:
+    required: true
+    claim: org_id
+    tables:
+      orders: org_id
+      customers: org_id
+      invoices: org_id
+  limits:
+    max_rows: 100
+    timeout_seconds: 10
+    allow_raw_pii: false
+    allow_raw_rows: true
+    allow_cross_joins: false
+    minimum_group_size: 5
+    differencing_budget: 5
+    differencing_window_seconds: 300
+
+auth:
+  token_env: ORION_LOCAL_TOKEN
+  jwt_secret_env: ORION_JWT_SECRET
+  allow_anonymous_local: false

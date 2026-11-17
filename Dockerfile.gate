@@ -1,0 +1,42 @@
+FROM python:3.12-slim AS builder
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml README.md ./
+COPY orion_gate ./orion_gate
+
+RUN pip install --upgrade pip && \
+    pip install --prefix=/install ".[postgres,mysql,bigquery]"
+
+
+FROM python:3.12-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PORT=8080 \
+    ORION_YAML_PATH=/etc/orion/orion.yaml
+
+WORKDIR /app
+
+RUN useradd --create-home --shell /bin/bash orionuser && \
+    mkdir -p /etc/orion
+
+COPY --from=builder /install /usr/local
+COPY orion_gate ./orion_gate
+COPY orion.example.yaml /etc/orion/orion.yaml
+
+RUN chown -R orionuser:orionuser /app /etc/orion
+
+USER orionuser
+
+EXPOSE 8080
+
+CMD ["sh", "-c", "orion-gate serve --config ${ORION_YAML_PATH} --host 0.0.0.0 --port ${PORT}"]
