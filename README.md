@@ -310,3 +310,5 @@ python -m unittest discover -s tests -p "test_*.py"
 - **Security Policy & Reporting:** [`SECURITY.md`](SECURITY.md) (`osenmuntu761@gmail.com`)
 - **Issues & PRs:** [GitHub Issues](https://github.com/Osen761/orion-gate/issues) — bug reports, dialect test cases, and adversarial SQL bypass PRs are welcome.
 - **License:** Orion Gate is open-source software licensed under the [Apache License 2.0](LICENSE).
+
+<!-- mcp-name: io.github.Osen761/orion-gate -->
