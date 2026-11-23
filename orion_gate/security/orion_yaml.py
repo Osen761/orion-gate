@@ -411,7 +411,7 @@ def _parse_database_url(raw_url: str, dialect: SQLDialect) -> dict[str, Any]:
     return {}
 
 
-def _flatten_column_collection(raw: Any) -> tuple[str, ...]:
+def _flatten_column_collection(raw: Any, *, include_bare: bool = True) -> tuple[str, ...]:
     """Normalize a list of column strings or `{table: [cols]}` mapping into qualified lowercase names."""
 
     if not raw:
@@ -425,18 +425,20 @@ def _flatten_column_collection(raw: Any) -> tuple[str, ...]:
                     norm_col = _normalize_ident(str(col))
                     if norm_col:
                         flattened.append(f"{norm_table}.{norm_col}" if norm_table else norm_col)
-                        flattened.append(norm_col)
+                        if include_bare:
+                            flattened.append(norm_col)
             elif isinstance(cols, str):
                 norm_col = _normalize_ident(cols)
                 if norm_col:
                     flattened.append(f"{norm_table}.{norm_col}" if norm_table else norm_col)
-                    flattened.append(norm_col)
+                    if include_bare:
+                        flattened.append(norm_col)
     elif isinstance(raw, (list, tuple, set)):
         for item in raw:
             norm = _normalize_ident(str(item))
             if norm:
                 flattened.append(norm)
-                if "." in norm:
+                if include_bare and "." in norm:
                     flattened.append(norm.split(".")[-1])
     return tuple(sorted(set(flattened)))
 
@@ -530,8 +532,8 @@ def parse_orion_yaml(raw_data: str | dict[str, Any], *, source_path: str | None 
     )
 
     raw_allowed_columns = policy_raw.get("allowed_columns")
-    allowed_columns = _flatten_column_collection(raw_allowed_columns) or None
-    denied_columns = _flatten_column_collection(policy_raw.get("denied_columns"))
+    allowed_columns = _flatten_column_collection(raw_allowed_columns, include_bare=False) or None
+    denied_columns = _flatten_column_collection(policy_raw.get("denied_columns"), include_bare=True)
     allow_json_columns = bool(policy_raw.get("allow_json_columns", False))
     raw_allowed_json_paths = policy_raw.get("allowed_json_paths") or []
     if not isinstance(raw_allowed_json_paths, (list, tuple, set)):
@@ -855,8 +857,12 @@ def resolve_standalone_gateway_auth(
                 token,
                 jwt_secret,
                 algorithms=["HS256"],
-                options={"verify_aud": False},
+                audience="orion-gate",
+                options={"require_exp": True, "verify_aud": True},
             )
+            claim_workspace_id = claims.get("workspace_id")
+            if claim_workspace_id is not None and str(claim_workspace_id).strip().lower() != str(workspace.id).lower():
+                raise ValueError("Token workspace_id does not match active orion.yaml workspace")
             tenant_values: dict[str, str] = {}
             raw_tv = claims.get("tenant_values")
             if isinstance(raw_tv, dict):

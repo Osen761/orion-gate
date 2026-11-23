@@ -72,7 +72,9 @@ SECRET_VALUE_RE = re.compile(
     r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
     r"|ok_[A-Za-z0-9_]{16,}"
     r"|sk-[A-Za-z0-9_-]{16,}"
-    r"|(?:rk|pk)_(?:live|test)_[A-Za-z0-9]{16,}"
+    r"|(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9_]{16,}"
+    r"|whsec_[A-Za-z0-9_]{16,}"
+    r"|(?:postgres(?:ql)?|mysql|redis|rediss)://[^\s\"'<>]+"
     r"|AKIA[0-9A-Z]{16}"
     r"|gh[pousr]_[A-Za-z0-9_]{20,}"
     r"|xox[baprs]-[A-Za-z0-9-]{16,}"
@@ -633,6 +635,7 @@ class ResultPolicyGateway:
         unsafe: list[str] = []
         masked_set = pre_masked_columns or set()
         sql_columns = set(context.sql_policy_decision.columns_referenced) if context.sql_policy_decision else set()
+        sql_tables = set(context.sql_policy_decision.tables_referenced) if context.sql_policy_decision else set()
         sql_base_columns = {_column_base_name(column) for column in sql_columns}
         sql_count_columns = _sql_count_columns(context)
         for column in result.columns:
@@ -641,6 +644,12 @@ class ResultPolicyGateway:
             base = _column_base_name(raw_name)
             candidates = {normalized, base}
             candidates.update(value for value in sql_columns if _column_base_name(value) == base)
+            for tbl in sql_tables:
+                norm_tbl = _normalize_identifier(tbl)
+                if norm_tbl:
+                    candidates.add(f"{norm_tbl}.{base}")
+                    if "." in norm_tbl:
+                        candidates.add(f"{norm_tbl.split('.')[-1]}.{base}")
 
             if denied_scope_columns and candidates & denied_scope_columns:
                 unsafe.append(raw_name)
@@ -760,7 +769,7 @@ class ResultPolicyGateway:
         redacted = result.copy()
         count = 0
         for column in redacted.columns:
-            if not pd.api.types.is_object_dtype(redacted[column]):
+            if not (pd.api.types.is_object_dtype(redacted[column]) or pd.api.types.is_string_dtype(redacted[column])):
                 continue
             values: list[Any] = []
             for value in redacted[column].tolist():
@@ -804,7 +813,7 @@ class ResultPolicyGateway:
             context is not None and not bool(getattr(context.scope, "allow_raw_pii", True))
         )
         for column in redacted.columns:
-            if not pd.api.types.is_object_dtype(redacted[column]):
+            if not (pd.api.types.is_object_dtype(redacted[column]) or pd.api.types.is_string_dtype(redacted[column])):
                 continue
             values: list[Any] = []
             for value in redacted[column].tolist():
@@ -837,7 +846,7 @@ class ResultPolicyGateway:
         truncated = result.copy()
         count = 0
         for column in truncated.columns:
-            if not pd.api.types.is_object_dtype(truncated[column]):
+            if not (pd.api.types.is_object_dtype(truncated[column]) or pd.api.types.is_string_dtype(truncated[column])):
                 continue
             values: list[Any] = []
             for value in truncated[column].tolist():

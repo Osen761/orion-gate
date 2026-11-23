@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "orion-gate"
-version = "0.4.0"
+version = "0.4.1"
 description = "Open-source deterministic SQL AST and MCP firewall between AI agents and production SQL databases."
 readme = "README.md"
 license = { text = "Apache-2.0" }

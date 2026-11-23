@@ -364,9 +364,14 @@ class SchemaProjectionService:
         normalized = _normalize_identifier(column_name)
         qualified = _normalize_identifier(f"{schema_object.qualified_name}.{column_name}")
         table_qualified = _normalize_identifier(f"{schema_object.name}.{column_name}")
-        if normalized in denied_columns or qualified in denied_columns:
+        if normalized in denied_columns or qualified in denied_columns or table_qualified in denied_columns:
             return True
-        if allowed_columns is not None and normalized not in allowed_columns and qualified not in allowed_columns:
+        if (
+            allowed_columns is not None
+            and normalized not in allowed_columns
+            and qualified not in allowed_columns
+            and table_qualified not in allowed_columns
+        ):
             return True
         if apply_sensitive_defaults and _is_sensitive_column(normalized):
             return True

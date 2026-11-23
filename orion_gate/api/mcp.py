@@ -260,7 +260,7 @@ async def _handle_single_jsonrpc(
             },
             "serverInfo": {
                 "name": "orion-gate",
-                "version": "0.4.0",
+                "version": "0.4.1",
             },
             "instructions": MCP_SERVER_INSTRUCTIONS,
         }
@@ -368,7 +368,7 @@ async def mcp_get_endpoint(request: Request) -> Response:
         status_code=status.HTTP_200_OK,
         content={
             "name": "orion-gate",
-            "version": "0.4.0",
+            "version": "0.4.1",
             "protocol": "mcp-streamable-http",
             "supportedProtocolVersions": list(SUPPORTED_MCP_VERSIONS),
             "tools": [tool["name"] for tool in MCP_TOOLS],

@@ -60,33 +60,81 @@ UNSAFE_FUNCTIONS = {
     "current_schema",
     "current_setting",
     "current_user",
+    "cursor_to_xml",
+    "cursor_to_xmlschema",
     "database",
+    "database_to_xml",
+    "database_to_xml_and_xmlschema",
+    "database_to_xmlschema",
     "dblink",
+    "dblink_connect",
+    "dblink_connect_u",
+    "dblink_exec",
+    "dblink_open",
+    "dblink_send_query",
     "generate_series",
+    "generate_subscripts",
     "get_lock",
     "http_get",
     "http_post",
     "inet_client_addr",
     "inet_server_addr",
+    "is_free_lock",
+    "is_used_lock",
     "load_file",
+    "load_xml",
+    "lo_create",
+    "lo_export",
+    "lo_from_bytea",
+    "lo_get",
     "lo_import",
+    "lo_open",
+    "lo_put",
+    "lo_unlink",
+    "loread",
+    "lowrite",
     "pg_advisory_lock",
     "pg_cancel_backend",
+    "pg_create_restore_point",
+    "pg_current_logfile",
+    "pg_export_snapshot",
+    "pg_log_backend_memory_contexts",
+    "pg_ls_archive_statusdir",
     "pg_ls_dir",
+    "pg_ls_logdir",
+    "pg_ls_tmpdir",
+    "pg_ls_waldir",
     "pg_read_binary_file",
     "pg_read_file",
+    "pg_reload_conf",
+    "pg_rotate_logfile",
     "pg_sleep",
     "pg_sleep_for",
     "pg_sleep_until",
     "pg_stat_file",
+    "pg_switch_wal",
     "pg_terminate_backend",
     "pg_try_advisory_lock",
+    "query_to_xml",
+    "query_to_xml_and_xmlschema",
+    "query_to_xmlschema",
     "regexp_split_to_table",
+    "release_lock",
+    "schema_to_xml",
+    "schema_to_xml_and_xmlschema",
+    "schema_to_xmlschema",
     "session_user",
+    "set_config",
     "sleep",
+    "sys_eval",
+    "sys_exec",
+    "table_to_xml",
+    "table_to_xml_and_xmlschema",
+    "table_to_xmlschema",
     "user",
     "version",
     "waitfor",
+    "xmlparse",
     "xp_cmdshell",
 }
 SENSITIVE_ALIAS_SOURCE_COLUMNS = {
@@ -100,9 +148,11 @@ SENSITIVE_ALIAS_SOURCE_COLUMNS = {
 } | SENSITIVE_COLUMN_NAMES
 OBFUSCATION_FUNCTIONS = {
     "array_agg",
+    "array_to_string",
     "ascii",
     "base64",
     "bit_length",
+    "btrim",
     "char",
     "chr",
     "concat",
@@ -116,27 +166,44 @@ OBFUSCATION_FUNCTIONS = {
     "from_base64",
     "group_concat",
     "hex",
+    "initcap",
     "left",
+    "lower",
+    "lpad",
+    "ltrim",
     "md5",
     "mid",
     "octet_length",
+    "overlay",
+    "pad",
+    "quote_ident",
+    "quote_literal",
+    "quote_nullable",
+    "regexp_matches",
     "regexp_replace",
+    "repeat",
     "replace",
     "reverse",
     "right",
+    "rpad",
+    "rtrim",
     "sha1",
     "sha2",
     "sha256",
     "sha512",
     "split_part",
     "string_agg",
+    "string_to_array",
     "substr",
     "substring",
+    "to_ascii",
     "to_base64",
     "to_hex",
     "translate",
+    "trim",
     "unhex",
     "unicode",
+    "upper",
 }
 BINARY_CAST_TYPES = {
     "binary",
@@ -564,19 +631,77 @@ def _extract_json_path(node: exp.Expression) -> str | None:
     return None
 
 
+def _numeric_literal(node: exp.Expression) -> float | None:
+    if isinstance(node, exp.Literal) and not node.is_string:
+        try:
+            return float(node.this)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def _is_tautology_condition(condition: exp.Expression) -> bool:
-    unwrapped = condition.this if isinstance(condition, exp.Paren) else condition
+    unwrapped = condition
+    while isinstance(unwrapped, exp.Paren):
+        unwrapped = unwrapped.this
     if isinstance(unwrapped, exp.Boolean):
         return bool(unwrapped.this)
-    if isinstance(unwrapped, exp.EQ):
+    if isinstance(unwrapped, exp.Not):
+        inner = unwrapped.this
+        while isinstance(inner, exp.Paren):
+            inner = inner.this
+        if isinstance(inner, exp.Boolean):
+            return not bool(inner.this)
+        return False
+    if isinstance(unwrapped, exp.Or):
+        return _is_tautology_condition(unwrapped.left) or _is_tautology_condition(unwrapped.right)
+    if isinstance(unwrapped, exp.And):
+        return _is_tautology_condition(unwrapped.left) and _is_tautology_condition(unwrapped.right)
+    if isinstance(unwrapped, (exp.EQ, exp.NEQ, exp.LT, exp.LTE, exp.GT, exp.GTE)):
         left = unwrapped.left
         right = unwrapped.right
+        if isinstance(unwrapped, exp.EQ) and isinstance(left, exp.Column) and isinstance(right, exp.Column):
+            if (
+                _normalize_identifier(left.table) == _normalize_identifier(right.table)
+                and _normalize_identifier(left.name) == _normalize_identifier(right.name)
+            ):
+                return True
         if isinstance(left, exp.Literal) and isinstance(right, exp.Literal):
-            return str(left.this) == str(right.this)
+            lnum = _numeric_literal(left)
+            rnum = _numeric_literal(right)
+            if lnum is not None and rnum is not None:
+                if isinstance(unwrapped, exp.EQ):
+                    return lnum == rnum
+                if isinstance(unwrapped, exp.NEQ):
+                    return lnum != rnum
+                if isinstance(unwrapped, exp.LT):
+                    return lnum < rnum
+                if isinstance(unwrapped, exp.LTE):
+                    return lnum <= rnum
+                if isinstance(unwrapped, exp.GT):
+                    return lnum > rnum
+                if isinstance(unwrapped, exp.GTE):
+                    return lnum >= rnum
+            lstr = str(left.this)
+            rstr = str(right.this)
+            if isinstance(unwrapped, exp.EQ):
+                return lstr == rstr
+            if isinstance(unwrapped, exp.NEQ):
+                return lstr != rstr
+            if isinstance(unwrapped, exp.LT):
+                return lstr < rstr
+            if isinstance(unwrapped, exp.LTE):
+                return lstr <= rstr
+            if isinstance(unwrapped, exp.GT):
+                return lstr > rstr
+            if isinstance(unwrapped, exp.GTE):
+                return lstr >= rstr
     return False
 
 
 def _function_name(function: exp.Func) -> str:
+    if isinstance(function, exp.Anonymous):
+        return _normalize_identifier(function.name)
     sql_name = function.sql_name()
     if sql_name:
         return _normalize_identifier(sql_name)
@@ -1092,6 +1217,19 @@ class SQLPolicyGateway:
         return tuple(violations)
 
     def _statement_type(self, expression: exp.Expression) -> SQLStatementType:
+        disallowed_nested = (
+            exp.Insert,
+            exp.Update,
+            exp.Delete,
+            exp.Drop,
+            exp.Create,
+            exp.Alter,
+            exp.Merge,
+            exp.Command,
+            exp.Into,
+        )
+        if any(expression.find_all(*disallowed_nested)):
+            return "unsupported"
         if isinstance(expression, exp.Select):
             return "with" if expression.args.get("with_") else "select"
         if isinstance(expression, (exp.Union, exp.Except, exp.Intersect)):
@@ -1243,14 +1381,32 @@ class SQLPolicyGateway:
                 elif table_name:
                     table_candidates = table_aliases.get(table_name, {table_name})
 
-            for table_candidate in table_candidates:
+            inferred_tables: set[str] = set()
+            from_derived_scope = source_scope is not None
+            if not table_name and scope_node is not None:
+                for src in scope_node.sources.values():
+                    if isinstance(src, exp.Table):
+                        tcs = _table_candidates(src)
+                        if not columns_by_table or any(
+                            column_name in columns_by_table.get(tc, set()) for tc in tcs
+                        ):
+                            inferred_tables.update(tcs)
+                    elif isinstance(src, Scope):
+                        if column_name in _scope_output_columns(src):
+                            from_derived_scope = True
+
+            for table_candidate in (table_candidates or inferred_tables):
                 if table_candidate:
                     candidates.add(f"{table_candidate}.{column_name}")
 
             if denied_columns and candidates & denied_columns:
                 violations.append(SQLPolicyViolation("column_denied", "Referenced column is denied."))
                 continue
-            if allowed_columns is not None and not (candidates & allowed_columns):
+            if (
+                allowed_columns is not None
+                and not from_derived_scope
+                and not (candidates & allowed_columns)
+            ):
                 violations.append(
                     SQLPolicyViolation("column_not_allowed", "Referenced column is outside allowed scope.")
                 )
@@ -1447,10 +1603,11 @@ class SQLPolicyGateway:
                 json_nodes.append(fn)
 
         for node in json_nodes:
-            target_arg = node.this
-            if target_arg is None and isinstance(node, exp.Anonymous) and node.expressions:
-                target_arg = node.expressions[0]
-            if target_arg is None:
+            if isinstance(node, exp.Anonymous):
+                target_arg = node.expressions[0] if node.expressions else None
+            else:
+                target_arg = node.this
+            if not isinstance(target_arg, exp.Expression):
                 continue
             target_cols = list(target_arg.find_all(exp.Column))
             if not target_cols:
@@ -1590,6 +1747,15 @@ class SQLPolicyGateway:
                     SQLPolicyViolation(
                         "sensitive_transform_denied",
                         "Sensitive or masked columns cannot be concatenated or string-transformed.",
+                    )
+                )
+
+        for array_expr in expression.find_all(exp.Array):
+            if _has_protected_column(array_expr):
+                violations.append(
+                    SQLPolicyViolation(
+                        "sensitive_transform_denied",
+                        "Sensitive or masked columns cannot be wrapped in arrays.",
                     )
                 )
 
@@ -1799,16 +1965,13 @@ class SQLPolicyGateway:
                 method = _normalize_identifier(join.method)
                 on_clause = join.args.get("on")
                 using_clause = join.args.get("using")
-                if kind == "cross" or (
-                    on_clause is None
-                    and using_clause is None
-                    and kind != "natural"
-                    and method != "natural"
+                if kind == "cross" or kind == "natural" or method == "natural" or (
+                    on_clause is None and using_clause is None
                 ):
                     violations.append(
                         SQLPolicyViolation(
                             "cross_join_denied",
-                            "CROSS JOIN and implicit Cartesian joins are not allowed.",
+                            "CROSS JOIN, NATURAL JOIN, and implicit Cartesian joins are not allowed.",
                         )
                     )
                     break
@@ -1820,6 +1983,13 @@ class SQLPolicyGateway:
                         )
                     )
                     break
+        if any(expression.find_all(exp.Lock)):
+            violations.append(
+                SQLPolicyViolation(
+                    "locking_clause_denied",
+                    "Row-locking clauses (FOR UPDATE / FOR SHARE) are not allowed.",
+                )
+            )
         ctes = list(expression.find_all(exp.CTE))
         if len(ctes) > MAX_CTES:
             violations.append(SQLPolicyViolation("too_many_ctes", "SQL exceeds CTE complexity limit."))

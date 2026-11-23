@@ -45,7 +45,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="Orion Gate — SQL AST & MCP Firewall",
     description="Open-source zero-trust SQL firewall for AI agents (/v1/schema, /v1/query, /mcp).",
-    version="0.4.0",
+    version="0.4.1",
     lifespan=lifespan,
 )
 
@@ -122,7 +122,7 @@ async def gate_health() -> dict[str, object]:
     return {
         "status": "ok",
         "service": "orion-gate",
-        "version": "0.4.0",
+        "version": "0.4.1",
         "mode": "standalone_orion_yaml" if cfg is not None else "demo_simulator",
         "datasources": len(cfg.datasources) if cfg is not None else 0,
     }

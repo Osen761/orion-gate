@@ -475,10 +475,17 @@ class OrionGateFirewallService:
 
         latency_ms = max(0, int((time.perf_counter() - started_at) * 1000))
 
-        if any(
-            getattr(v, "code", "") == "small_group_suppressed"
-            for v in getattr(result_decision, "violations", ())
-        ) or any("k-anonymity" in str(w).lower() for w in getattr(result_decision, "warnings", ())):
+        if (
+            bool(getattr(result_decision, "small_group_warnings", ()))
+            or any(
+                getattr(v, "code", "") in {"small_group_suppressed", "minimum_group_size"}
+                for v in getattr(result_decision, "violations", ())
+            )
+            or any(
+                "k-anonymity" in str(w).lower() or "small groups" in str(w).lower()
+                for w in getattr(result_decision, "warnings", ())
+            )
+        ):
             diff_guard.mark_small_group_suppressed(
                 scope=scope,
                 session_key=session_key,

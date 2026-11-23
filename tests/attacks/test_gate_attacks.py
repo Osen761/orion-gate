@@ -407,5 +407,281 @@ class OrionGateEndpointAttackTests(unittest.TestCase):
             self.assertNotIn("sk-live_", serialized)
 
 
+class OrionGateHardeningRegressionTests(unittest.TestCase):
+    """Adversarial regressions for AST, auth, differencing, result scrubbing, and demo DoS loopholes."""
+
+    def setUp(self) -> None:
+        self.gateway = SQLPolicyGateway()
+        self.auto_ctx = _make_auto_inject_context()
+
+    def tearDown(self) -> None:
+        clear_active_orion_yaml()
+
+    def test_dangerous_dynamic_sql_xml_file_and_config_functions_blocked(self) -> None:
+        for sql in (
+            "SELECT query_to_xml('SELECT * FROM admin_audit_secrets', true, true, '') FROM orders",
+            "SELECT table_to_xml('orders', true, true, '') FROM orders",
+            "SELECT lo_export(1234, '/tmp/leak') FROM orders",
+            "SELECT set_config('statement_timeout', '0', false) FROM orders",
+            "SELECT dblink_exec('dbname=app', 'DROP TABLE orders') FROM orders",
+            "SELECT pg_ls_waldir() FROM orders",
+        ):
+            with self.subTest(sql=sql):
+                decision = self.gateway.validate(sql, self.auto_ctx)
+                self.assertFalse(decision.allowed)
+                self.assertIn("unsafe_function", {v.code for v in decision.violations})
+
+    def test_data_modifying_cte_select_into_and_locking_clauses_blocked(self) -> None:
+        for sql, expected_code in (
+            (
+                "WITH d AS (DELETE FROM orders WHERE business_id = 'tenant_A' RETURNING id) SELECT id FROM d",
+                "non_read_only_statement",
+            ),
+            (
+                "SELECT id, total INTO orders FROM orders",
+                "non_read_only_statement",
+            ),
+            (
+                "SELECT id, total FROM orders FOR UPDATE",
+                "locking_clause_denied",
+            ),
+            (
+                "SELECT id, total FROM orders FOR SHARE",
+                "locking_clause_denied",
+            ),
+        ):
+            with self.subTest(sql=sql):
+                decision = self.gateway.validate(sql, self.auto_ctx)
+                self.assertFalse(decision.allowed)
+                self.assertIn(expected_code, {v.code for v in decision.violations})
+
+    def test_cartesian_tautology_and_natural_joins_blocked(self) -> None:
+        for sql in (
+            "SELECT a.id, b.id FROM orders a JOIN orders b ON a.id = a.id",
+            "SELECT a.id, b.id FROM orders a JOIN orders b ON 1 < 2",
+            "SELECT a.id, b.id FROM orders a JOIN orders b ON a.id = b.id OR 1 = 1",
+            "WITH x AS (SELECT 1 AS dummy) SELECT a.id FROM orders a NATURAL JOIN x",
+        ):
+            with self.subTest(sql=sql):
+                decision = self.gateway.validate(sql, self.auto_ctx)
+                self.assertFalse(decision.allowed)
+                self.assertIn("cross_join_denied", {v.code for v in decision.violations})
+
+    def test_pii_string_array_and_overlay_obfuscation_blocked(self) -> None:
+        for sql in (
+            "SELECT email, string_to_array(email, '@') FROM customers",
+            "SELECT email, overlay(email placing 'x' from 1 for 1) FROM customers",
+            "SELECT email, btrim(email, 'a') FROM customers",
+            "SELECT email, lpad(email, 50, 'x') FROM customers",
+            "SELECT email, repeat(email, 2) FROM customers",
+            "SELECT email, ARRAY[email] FROM customers",
+        ):
+            with self.subTest(sql=sql):
+                decision = self.gateway.validate(sql, self.auto_ctx)
+                self.assertFalse(decision.allowed)
+                self.assertIn("sensitive_transform_denied", {v.code for v in decision.violations})
+
+    def test_per_table_allowed_columns_does_not_leak_across_tables(self) -> None:
+        cfg = parse_orion_yaml(
+            {
+                "version": "1.0",
+                "datasource": {"name": "db", "dialect": "postgres", "url": "postgresql://u:p@localhost/db"},
+                "policy": {
+                    "allowed_tables": ["orders", "customers"],
+                    "allowed_columns": {
+                        "orders": ["id", "org_id", "amount"],
+                        "customers": ["id", "org_id", "phone"],
+                    },
+                    "tenant_isolation": {
+                        "required": True,
+                        "claim": "org_id",
+                        "tables": {"orders": "org_id", "customers": "org_id"},
+                    },
+                },
+            }
+        )
+        ds = cfg.primary_datasource
+        workspace = Workspace(id=cfg.workspace_id, name="t", plan="standalone", owner_email="a@b.c")
+        auth = AuthContext(workspace_id=str(cfg.workspace_id), workspace=workspace, auth_type="api_key", user_id="u1")
+        scope = cfg.build_effective_scope(
+            datasource=ds, auth=auth, requested_tenant_values={"org_id": "org_acme"}
+        )
+        raw_schema = (
+            "Table: orders (100 rows)\n"
+            "  - id: integer\n"
+            "  - org_id: text\n"
+            "  - amount: numeric\n"
+            "  - phone: text\n"
+            "Table: customers (100 rows)\n"
+            "  - id: integer\n"
+            "  - org_id: text\n"
+            "  - phone: text\n"
+        )
+        connector = ds.to_connector_model(cfg.workspace_id, scope.allowed_tables)
+        projected = SchemaProjectionService().project_schema(connector, raw_schema, scope)
+
+        # orders.phone is NOT allowed even though customers.phone is allowed
+        self.assertIn("orders.phone", projected.denied_columns)
+        self.assertIn("customers.phone", projected.included_columns)
+
+        ctx = SQLValidationContext(
+            dialect="postgres", scope=scope, projected_schema=projected, auto_inject_tenant_filters=True
+        )
+        ok_orders = self.gateway.validate("SELECT id, amount FROM orders", ctx)
+        self.assertTrue(ok_orders.allowed, ok_orders.violations)
+
+        bad_cross_table = self.gateway.validate("SELECT id, phone FROM orders", ctx)
+        self.assertFalse(bad_cross_table.allowed)
+
+    def test_jwt_rejects_missing_exp_wrong_aud_and_wrong_workspace(self) -> None:
+        from datetime import datetime, timedelta, timezone
+        from jose import jwt
+
+        cfg = parse_orion_yaml(SAMPLE_GATE_YAML)
+        set_active_orion_yaml(cfg)
+        secret = "gate_attack_test_secret_32bytes_min"
+        now = datetime.now(timezone.utc)
+        exp = int((now + timedelta(minutes=15)).timestamp())
+
+        no_exp = jwt.encode(
+            {"sub": "a", "aud": "orion-gate", "workspace_id": str(cfg.workspace_id), "org_id": "org_acme"},
+            secret,
+            algorithm="HS256",
+        )
+        wrong_aud = jwt.encode(
+            {"sub": "a", "aud": "other-service", "workspace_id": str(cfg.workspace_id), "org_id": "org_acme", "exp": exp},
+            secret,
+            algorithm="HS256",
+        )
+        wrong_ws = jwt.encode(
+            {"sub": "a", "aud": "orion-gate", "workspace_id": "00000000-0000-0000-0000-000000009999", "org_id": "org_acme", "exp": exp},
+            secret,
+            algorithm="HS256",
+        )
+
+        with (
+            patch.dict(os.environ, {"ORION_JWT_SECRET": secret}),
+            patch.object(PostgresConnector, "get_schema", return_value=RAW_SAAS_SCHEMA),
+        ):
+            client = TestClient(app)
+            for label, tok in (("no_exp", no_exp), ("wrong_aud", wrong_aud), ("wrong_ws", wrong_ws)):
+                with self.subTest(token=label):
+                    resp = client.get("/v1/schema", headers={"Authorization": f"Bearer {tok}"})
+                    self.assertEqual(resp.status_code, 401)
+
+    def test_result_policy_scrubs_stripe_keys_db_uris_and_string_dtype(self) -> None:
+        from orion_gate.security.result_policy import ResultPolicyGateway, ResultValidationContext
+
+        scope = self.auto_ctx.scope
+        projected = self.auto_ctx.projected_schema
+        df = pd.DataFrame(
+            {
+                "status": pd.Series(
+                    [
+                        "sk_live_AbCdEf1234567890123456",
+                        "whsec_live_8f92a7c4b1e0d3948576",
+                        "postgresql://root:Sup3rS3cr3t@10.0.4.12:5432/prod",
+                    ],
+                    dtype="string",
+                )
+            }
+        )
+        decision = ResultPolicyGateway().validate(
+            df, ResultValidationContext(scope=scope, projected_schema=projected)
+        )
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.decision, "redacted")
+        rows = [r["status"] for r in decision.safe_result.rows]
+        self.assertEqual(rows, ["[REDACTED]", "[REDACTED]", "[REDACTED]"])
+
+    def test_firewall_marks_small_group_suppression_and_blocks_followup_differencing(self) -> None:
+        from orion_gate.security.differencing import reset_differencing_store
+
+        reset_differencing_store()
+        cfg = parse_orion_yaml(
+            {
+                "version": "1.0",
+                "datasource": {"name": "db", "dialect": "postgres", "url": "postgresql://u:p@localhost/db"},
+                "policy": {
+                    "allowed_tables": ["orders"],
+                    "limits": {
+                        "minimum_group_size": 5,
+                        "differencing_budget": 5,
+                        "differencing_window_seconds": 300,
+                    },
+                },
+                "auth": {"static_tokens": ["diff-test-token"]},
+            }
+        )
+        set_active_orion_yaml(cfg)
+
+        class _SmallGroupConn:
+            def __init__(self) -> None:
+                self.sql_policy_context = None
+                self.last_result_policy_decision = None
+
+            def get_schema(self) -> str:
+                return RAW_SAAS_SCHEMA
+
+            def execute_sql(self, sql: str):
+                from orion_gate.security.result_policy import ResultPolicyGateway, ResultValidationContext
+
+                assert self.sql_policy_context is not None
+                sql_dec = SQLPolicyGateway().validate(sql, self.sql_policy_context)
+                df = pd.DataFrame({"status": ["paid", "rare"], "people": [20, 2]})
+                res_dec = ResultPolicyGateway().validate(
+                    df,
+                    ResultValidationContext(
+                        scope=self.sql_policy_context.scope,
+                        projected_schema=self.sql_policy_context.projected_schema,
+                        sql_policy_decision=sql_dec,
+                    ),
+                )
+                self.last_result_policy_decision = res_dec
+                return res_dec.safe_result.to_dataframe(), "ok"
+
+            def close(self) -> None:
+                return None
+
+        client = TestClient(app)
+        headers = {"Authorization": "Bearer diff-test-token"}
+        try:
+            with patch("orion_gate.security.firewall.get_connector", return_value=_SmallGroupConn()):
+                r1 = client.post(
+                    "/v1/query",
+                    headers=headers,
+                    json={"sql": "SELECT status, COUNT(*) AS people FROM orders WHERE total > 10 GROUP BY status"},
+                )
+                self.assertEqual(r1.status_code, 200)
+                # Follow-up positive variation on same template after small-group suppression must be blocked
+                r2 = client.post(
+                    "/v1/query",
+                    headers=headers,
+                    json={"sql": "SELECT status, COUNT(*) AS people FROM orders WHERE total > 20 GROUP BY status"},
+                )
+                self.assertEqual(r2.status_code, 403)
+                self.assertIn(
+                    "differencing_attack_denied",
+                    {v["code"] for v in r2.json()["policy"]["violations"]},
+                )
+        finally:
+            reset_differencing_store()
+
+    def test_demo_simulator_aborts_recursive_cte_dos(self) -> None:
+        client = TestClient(app)
+        resp = client.post(
+            "/v1/demo/simulate",
+            json={
+                "sql": "WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM r) SELECT COUNT(*) FROM r",
+                "active_tenant": "org_acme",
+                "dialect": "postgres",
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["orion_gate"]["status"], "blocked")
+        self.assertEqual(body["raw_agent"]["status"], "syntax_error")
+
+
 if __name__ == "__main__":
     unittest.main()

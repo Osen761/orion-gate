@@ -464,6 +464,15 @@ def _create_isolated_demo_db() -> sqlite3.Connection:
 
     # Lock down connection with strict read-only authorizer so no DDL/DML/ATTACH/PRAGMA can execute.
     conn.set_authorizer(_readonly_sqlite_authorizer)
+
+    # Bound SQLite VM steps so malicious WITH RECURSIVE queries cannot hang worker threads.
+    step_counter = [0]
+
+    def _step_limit_handler() -> int:
+        step_counter[0] += 1
+        return 1 if step_counter[0] > 50 else 0
+
+    conn.set_progress_handler(_step_limit_handler, 1000)
     return conn
 
 

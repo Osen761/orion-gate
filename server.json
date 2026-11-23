@@ -3,7 +3,7 @@
   "name": "io.github.Osen761/orion-gate",
   "title": "Orion Gate",
   "description": "Zero-trust SQL AST & MCP firewall enforcing tenant isolation, PII scrubbing, and schema allowlists.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "websiteUrl": "https://github.com/Osen761/orion-gate",
   "repository": {
     "url": "https://github.com/Osen761/orion-gate",
@@ -13,7 +13,7 @@
     {
       "registryType": "pypi",
       "identifier": "orion-gate",
-      "version": "0.4.0",
+      "version": "0.4.1",
       "transport": {
         "type": "streamable-http",
         "url": "http://localhost:8000/mcp",
