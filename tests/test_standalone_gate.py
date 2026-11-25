@@ -412,5 +412,97 @@ class StandaloneLiveAttackSimulatorAndPackagingTests(unittest.TestCase):
         self.assertTrue((GATE_ROOT / "benchmarks" / "ast_latency.py").is_file())
 
 
+class GatewayControlPlaneAgentTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        clear_active_orion_yaml()
+
+    def test_standalone_mode_makes_zero_control_plane_calls(self) -> None:
+        import asyncio
+        from orion_gate.security.cloud_sync import CloudTelemetrySyncClient, GatewayControlPlaneAgent
+
+        cfg = parse_orion_yaml(SAMPLE_YAML)
+        set_active_orion_yaml(cfg)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ORION_API_KEY", None)
+            os.environ.pop("ORION_CLOUD_URL", None)
+            self.assertFalse(CloudTelemetrySyncClient(cfg).control_plane_enabled)
+            reloaded = asyncio.run(GatewayControlPlaneAgent().sync_once())
+            self.assertFalse(reloaded)
+
+    def test_register_heartbeat_hot_reload_and_fail_open_on_cloud_outage(self) -> None:
+        import asyncio
+        import httpx
+        from orion_gate.security.cloud_sync import GatewayControlPlaneAgent
+
+        initial_yaml = SAMPLE_YAML + "\ncloud:\n  sync_policies: true\n"
+        cfg = parse_orion_yaml(initial_yaml)
+        set_active_orion_yaml(cfg)
+
+        updated_dict = {
+            "version": "1.0",
+            "workspace": {"id": str(cfg.workspace_id), "name": cfg.workspace_name},
+            "datasource": {
+                "id": str(cfg.primary_datasource.id),
+                "name": cfg.primary_datasource.name,
+                "dialect": "postgres",
+                "url": "postgresql://readonly:secret@db.internal:5432/acme_prod?sslmode=require",
+            },
+            "policy": {
+                "allowed_tables": ["orders"],
+                "limits": {"max_rows": 25, "timeout_seconds": 5},
+            },
+        }
+
+        calls: list[tuple[str, str]] = []
+        fail_cloud = {"enabled": False}
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            calls.append((request.method, request.url.path))
+            if fail_cloud["enabled"]:
+                return httpx.Response(503, json={"detail": "Cloud temporarily unavailable"})
+            if request.url.path == "/v1/gateways/register":
+                return httpx.Response(
+                    201,
+                    json={"id": "00000000-0000-0000-0000-00000000aaaa", "policy_drift": True},
+                )
+            if request.url.path == "/v1/telemetry/policy-bundle":
+                return httpx.Response(200, json={"orion_yaml": updated_dict})
+            if request.url.path == "/v1/gateways/00000000-0000-0000-0000-00000000aaaa/heartbeat":
+                return httpx.Response(200, json={"sync_required": False, "policy_drift": False})
+            return httpx.Response(404)
+
+        agent = GatewayControlPlaneAgent(
+            transport=httpx.MockTransport(_handler),
+            api_key="ok_test_edge_key_123456",
+            endpoint="https://cloud.oriongate.test",
+        )
+
+        # 1. First sync registers, sees policy_drift=True, hot-reloads policy (max_rows=25), preserves local auth
+        reloaded = asyncio.run(agent.sync_once())
+        self.assertTrue(reloaded)
+        active = get_active_orion_yaml()
+        self.assertIsNotNone(active)
+        self.assertEqual(active.policy.limits.max_rows, 25)
+        self.assertEqual(active.auth.token_env, cfg.auth.token_env)
+        self.assertEqual(
+            calls,
+            [
+                ("POST", "/v1/gateways/register"),
+                ("GET", "/v1/telemetry/policy-bundle"),
+                ("POST", "/v1/gateways/00000000-0000-0000-0000-00000000aaaa/heartbeat"),
+            ],
+        )
+
+        # 2. Second sync heartbeats cleanly with no drift
+        reloaded2 = asyncio.run(agent.sync_once())
+        self.assertFalse(reloaded2)
+
+        # 3. Cloud 503 outage fails open without crashing and keeps active policy intact
+        fail_cloud["enabled"] = True
+        reloaded3 = asyncio.run(agent.sync_once())
+        self.assertFalse(reloaded3)
+        self.assertEqual(get_active_orion_yaml().policy.limits.max_rows, 25)
+
+
 if __name__ == "__main__":
     unittest.main()

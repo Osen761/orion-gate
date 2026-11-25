@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import socket
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
 import httpx
 
+from orion_gate import __version__ as ORION_GATE_VERSION
 from orion_gate.security.secrets import safe_text_preview
 from orion_gate.authz.connectors import EffectiveAccessScope
 from orion_gate.schemas import (
@@ -18,7 +22,12 @@ from orion_gate.schemas import (
     TelemetryEventItem,
     TelemetryIngestRequest,
 )
-from orion_gate.security.orion_yaml import OrionYamlConfig, parse_orion_yaml
+from orion_gate.security.orion_yaml import (
+    OrionYamlConfig,
+    get_active_orion_yaml,
+    parse_orion_yaml,
+    set_active_orion_yaml,
+)
 from orion_gate.security.result_policy import ResultPolicyDecision
 from orion_gate.security.sql_policy import POLICY_VERSION, SQLDialect, SQLPolicyDecision
 
@@ -191,6 +200,103 @@ class CloudTelemetrySyncClient:
             logger.warning("Failed to ship telemetry event to Orion Cloud", exc_info=True)
             return False
 
+    @property
+    def control_plane_enabled(self) -> bool:
+        """True only when an API key and explicit Cloud endpoint (or test transport) are configured."""
+
+        if not self.api_key:
+            return False
+        explicit_url = os.getenv(
+            self.config.cloud.endpoint_env if self.config else "ORION_CLOUD_URL", ""
+        ).strip()
+        return bool(explicit_url or self.transport is not None)
+
+    async def register_gateway(
+        self,
+        *,
+        name: str,
+        node_key: str,
+        dialect: str | None = None,
+        environment: str = "production",
+        active_policy_hash: str | None = None,
+        active_policy_version: int | None = None,
+        hostname: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Register this edge Orion Gate node with Orion Cloud (fail-open on network errors)."""
+
+        if not self.control_plane_enabled:
+            return None
+        payload: dict[str, Any] = {
+            "name": name,
+            "node_key": node_key,
+            "orion_gate_version": ORION_GATE_VERSION,
+            "environment": environment,
+            "hostname": hostname or socket.gethostname(),
+        }
+        if dialect in {"postgres", "mysql", "bigquery"}:
+            payload["dialect"] = dialect
+        if active_policy_hash:
+            payload["active_policy_hash"] = active_policy_hash
+        if active_policy_version is not None:
+            payload["active_policy_version"] = active_policy_version
+
+        try:
+            async with httpx.AsyncClient(
+                base_url=self.endpoint,
+                timeout=5.0,
+                transport=self.transport,
+            ) as client:
+                response = await client.post(
+                    "/v1/gateways/register",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                )
+                response.raise_for_status()
+                body = response.json()
+                return body if isinstance(body, dict) else None
+        except Exception:
+            logger.warning("Failed to register Orion Gate node with Orion Cloud", exc_info=True)
+            return None
+
+    async def send_heartbeat(
+        self,
+        gateway_id: str,
+        *,
+        active_policy_hash: str | None = None,
+        active_policy_version: int | None = None,
+        hostname: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Send a periodic health & policy-sync heartbeat to Orion Cloud (fail-open)."""
+
+        if not self.control_plane_enabled or not gateway_id:
+            return None
+        payload: dict[str, Any] = {
+            "orion_gate_version": ORION_GATE_VERSION,
+            "hostname": hostname or socket.gethostname(),
+        }
+        if active_policy_hash:
+            payload["active_policy_hash"] = active_policy_hash
+        if active_policy_version is not None:
+            payload["active_policy_version"] = active_policy_version
+
+        try:
+            async with httpx.AsyncClient(
+                base_url=self.endpoint,
+                timeout=5.0,
+                transport=self.transport,
+            ) as client:
+                response = await client.post(
+                    f"/v1/gateways/{gateway_id}/heartbeat",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                )
+                response.raise_for_status()
+                body = response.json()
+                return body if isinstance(body, dict) else None
+        except Exception:
+            logger.warning("Failed to send Orion Gate heartbeat to Orion Cloud", exc_info=True)
+            return None
+
     async def pull_policy_bundle(self) -> OrionYamlConfig:
         """Fetch the workspace's declarative policy bundle from Orion Cloud."""
 
@@ -214,3 +320,126 @@ class CloudTelemetrySyncClient:
             return parse_orion_yaml(yaml_dict, source_path="orion_cloud_bundle")
         yaml_text = str(body.get("orion_yaml_text") or "")
         return parse_orion_yaml(yaml_text, source_path="orion_cloud_bundle")
+
+
+class GatewayControlPlaneAgent:
+    """Optional background loop that registers this node, heartbeats, and hot-reloads policies.
+
+    Completely inert unless both ORION_API_KEY and ORION_CLOUD_URL are configured.
+    Any control-plane failure is logged and ignored so local traffic is never disrupted.
+    """
+
+    def __init__(
+        self,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+        api_key: str | None = None,
+        endpoint: str | None = None,
+    ) -> None:
+        self.transport = transport
+        self.api_key = api_key
+        self.endpoint = endpoint
+        self.gateway_id: str | None = None
+        self.active_policy_version: int | None = None
+
+    def _resolve_identity(self, cfg: OrionYamlConfig) -> tuple[str, str, str, str]:
+        hostname = socket.gethostname()
+        name = (
+            os.getenv("ORION_GATEWAY_NAME", "").strip()
+            or cfg.cloud.gateway_name
+            or f"orion-gate-{hostname}"
+        )
+        node_key = (
+            os.getenv("ORION_NODE_KEY", "").strip()
+            or cfg.cloud.node_key
+            or f"{hostname}-{cfg.primary_datasource.name}"
+        )
+        environment = (
+            os.getenv("ORION_ENVIRONMENT", "").strip()
+            or cfg.cloud.environment
+            or "production"
+        )
+        return name, node_key, environment, hostname
+
+    async def sync_once(self) -> bool:
+        """Run one register/heartbeat + conditional policy hot-reload cycle. Returns True if reloaded."""
+
+        cfg = get_active_orion_yaml()
+        if cfg is None:
+            return False
+        client = CloudTelemetrySyncClient(
+            cfg,
+            api_key=self.api_key,
+            endpoint=self.endpoint,
+            transport=self.transport,
+        )
+        if not client.control_plane_enabled:
+            return False
+
+        name, node_key, environment, hostname = self._resolve_identity(cfg)
+        sync_required = False
+
+        if self.gateway_id is None:
+            reg = await client.register_gateway(
+                name=name,
+                node_key=node_key,
+                dialect=cfg.primary_datasource.dialect,
+                environment=environment,
+                active_policy_hash=cfg.policy_hash,
+                active_policy_version=self.active_policy_version,
+                hostname=hostname,
+            )
+            if not reg or not reg.get("id"):
+                return False
+            self.gateway_id = str(reg["id"])
+            sync_required = bool(reg.get("policy_drift"))
+        else:
+            hb = await client.send_heartbeat(
+                self.gateway_id,
+                active_policy_hash=cfg.policy_hash,
+                active_policy_version=self.active_policy_version,
+                hostname=hostname,
+            )
+            if not hb:
+                return False
+            sync_required = bool(hb.get("sync_required") or hb.get("policy_drift"))
+
+        if sync_required and cfg.cloud.sync_policies:
+            try:
+                pulled = await client.pull_policy_bundle()
+                # Preserve local auth & cloud settings when hot-reloading policy rules from Cloud
+                merged = replace(pulled, auth=cfg.auth, cloud=cfg.cloud)
+                set_active_orion_yaml(merged)
+                await client.send_heartbeat(
+                    self.gateway_id,
+                    active_policy_hash=merged.policy_hash,
+                    active_policy_version=self.active_policy_version,
+                    hostname=hostname,
+                )
+                logger.info(
+                    "Hot-reloaded Orion Gate policy from Cloud (hash=%s)",
+                    merged.policy_hash[:12],
+                )
+                return True
+            except Exception:
+                logger.warning(
+                    "Policy hot-reload from Orion Cloud failed; keeping current local policy",
+                    exc_info=True,
+                )
+        return False
+
+    async def run_forever(self) -> None:
+        """Continuously run heartbeat + policy-sync cycles until cancelled."""
+
+        while True:
+            interval = 30
+            try:
+                cfg = get_active_orion_yaml()
+                if cfg is not None:
+                    interval = max(5, int(cfg.cloud.heartbeat_interval_seconds))
+                await self.sync_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("Gateway control-plane loop error; retrying", exc_info=True)
+            await asyncio.sleep(interval)

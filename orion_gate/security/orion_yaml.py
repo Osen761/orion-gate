@@ -183,6 +183,10 @@ class OrionYamlCloudConfig:
     default_endpoint: str = "https://api.oriongate.dev"
     sync_telemetry: bool = True
     sync_policies: bool = False
+    gateway_name: str | None = None
+    node_key: str | None = None
+    environment: str = "production"
+    heartbeat_interval_seconds: int = 30
 
 
 @dataclass(frozen=True)
@@ -643,6 +647,10 @@ def parse_orion_yaml(raw_data: str | dict[str, Any], *, source_path: str | None 
         default_endpoint=str(cloud_raw.get("default_endpoint") or "https://api.oriongate.dev").strip(),
         sync_telemetry=bool(cloud_raw.get("sync_telemetry", True)),
         sync_policies=bool(cloud_raw.get("sync_policies", False)),
+        gateway_name=str(cloud_raw.get("gateway_name")).strip() if cloud_raw.get("gateway_name") else None,
+        node_key=str(cloud_raw.get("node_key")).strip() if cloud_raw.get("node_key") else None,
+        environment=str(cloud_raw.get("environment") or "production").strip(),
+        heartbeat_interval_seconds=max(5, int(cloud_raw.get("heartbeat_interval_seconds", 30))),
     )
 
     return OrionYamlConfig(

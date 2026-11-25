@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -23,6 +24,7 @@ from orion_gate.errors import (
     request_id_from_request,
     safe_message_for,
 )
+from orion_gate.security.cloud_sync import CloudTelemetrySyncClient, GatewayControlPlaneAgent
 from orion_gate.security.cors import (
     CORS_ALLOWED_HEADERS,
     CORS_ALLOWED_METHODS,
@@ -36,9 +38,19 @@ logger = logging.getLogger("orion.gate")
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    sync_task: asyncio.Task[None] | None = None
+    cfg = get_active_orion_yaml()
+    if cfg is not None and CloudTelemetrySyncClient(cfg).control_plane_enabled:
+        sync_task = asyncio.create_task(GatewayControlPlaneAgent().run_forever())
     try:
         yield
     finally:
+        if sync_task is not None:
+            sync_task.cancel()
+            try:
+                await sync_task
+            except asyncio.CancelledError:
+                pass
         close_all_connector_pools()
 
 
