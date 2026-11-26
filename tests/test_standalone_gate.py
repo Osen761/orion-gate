@@ -453,11 +453,13 @@ class GatewayControlPlaneAgentTests(unittest.TestCase):
             },
         }
 
-        calls: list[tuple[str, str]] = []
+        calls: list[tuple[str, str, str]] = []
         fail_cloud = {"enabled": False}
+        heartbeat_versions: list[int | None] = []
 
         def _handler(request: httpx.Request) -> httpx.Response:
-            calls.append((request.method, request.url.path))
+            q = request.url.query
+            calls.append((request.method, request.url.path, q.decode() if isinstance(q, bytes) else (q or "")))
             if fail_cloud["enabled"]:
                 return httpx.Response(503, json={"detail": "Cloud temporarily unavailable"})
             if request.url.path == "/v1/gateways/register":
@@ -466,8 +468,10 @@ class GatewayControlPlaneAgentTests(unittest.TestCase):
                     json={"id": "00000000-0000-0000-0000-00000000aaaa", "policy_drift": True},
                 )
             if request.url.path == "/v1/telemetry/policy-bundle":
-                return httpx.Response(200, json={"orion_yaml": updated_dict})
+                return httpx.Response(200, json={"policy_version": 7, "orion_yaml": updated_dict})
             if request.url.path == "/v1/gateways/00000000-0000-0000-0000-00000000aaaa/heartbeat":
+                body = json.loads(request.content.decode("utf-8"))
+                heartbeat_versions.append(body.get("active_policy_version"))
                 return httpx.Response(200, json={"sync_required": False, "policy_drift": False})
             return httpx.Response(404)
 
@@ -477,19 +481,21 @@ class GatewayControlPlaneAgentTests(unittest.TestCase):
             endpoint="https://cloud.oriongate.test",
         )
 
-        # 1. First sync registers, sees policy_drift=True, hot-reloads policy (max_rows=25), preserves local auth
-        reloaded = asyncio.run(agent.sync_once())
+        # 1. First sync registers, sees policy_drift=True, pulls ?environment=staging, hot-reloads policy (max_rows=25), preserves local auth
+        with patch.dict(os.environ, {"ORION_ENVIRONMENT": "staging"}, clear=False):
+            reloaded = asyncio.run(agent.sync_once())
         self.assertTrue(reloaded)
         active = get_active_orion_yaml()
         self.assertIsNotNone(active)
         self.assertEqual(active.policy.limits.max_rows, 25)
         self.assertEqual(active.auth.token_env, cfg.auth.token_env)
+        self.assertEqual(heartbeat_versions, [7])
         self.assertEqual(
             calls,
             [
-                ("POST", "/v1/gateways/register"),
-                ("GET", "/v1/telemetry/policy-bundle"),
-                ("POST", "/v1/gateways/00000000-0000-0000-0000-00000000aaaa/heartbeat"),
+                ("POST", "/v1/gateways/register", ""),
+                ("GET", "/v1/telemetry/policy-bundle", "environment=staging"),
+                ("POST", "/v1/gateways/00000000-0000-0000-0000-00000000aaaa/heartbeat", ""),
             ],
         )
 

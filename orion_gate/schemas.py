@@ -145,6 +145,8 @@ class TelemetryEventItem(BaseModel):
     latency_ms: int = Field(default=0, ge=0)
     policy_version: str = Field(default="phase_2_v1", max_length=64)
     scope_version: str | None = Field(default=None, max_length=128)
+    environment: str | None = Field(default=None, max_length=64)
+    gateway_node_key: str | None = Field(default=None, max_length=128)
     error_message_safe: str | None = Field(default=None, max_length=700)
     occurred_at: datetime | None = None
 

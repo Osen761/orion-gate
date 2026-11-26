@@ -182,7 +182,34 @@ class CloudTelemetrySyncClient:
         if not explicit_url and self.transport is None:
             return _TELEMETRY_HOOK is not None
 
-        payload = TelemetryIngestRequest(events=[event]).model_dump(mode="json")
+        outbound_event = event
+        if self.config is not None and (
+            outbound_event.environment is None or outbound_event.gateway_node_key is None
+        ):
+            hostname = socket.gethostname()
+            resolved_env = (
+                outbound_event.environment
+                or os.getenv("ORION_ENVIRONMENT", "").strip()
+                or self.config.cloud.environment
+                or "production"
+            )
+            resolved_node = (
+                outbound_event.gateway_node_key
+                or os.getenv("ORION_NODE_KEY", "").strip()
+                or self.config.cloud.node_key
+                or f"{hostname}-{self.config.primary_datasource.name}"
+            )
+            outbound_event = outbound_event.model_copy(
+                update={
+                    "environment": resolved_env,
+                    "gateway_node_key": resolved_node,
+                }
+            )
+
+        payload = TelemetryIngestRequest(events=[outbound_event]).model_dump(
+            mode="json",
+            exclude_none=True,
+        )
         try:
             async with httpx.AsyncClient(
                 base_url=self.endpoint,
@@ -297,12 +324,22 @@ class CloudTelemetrySyncClient:
             logger.warning("Failed to send Orion Gate heartbeat to Orion Cloud", exc_info=True)
             return None
 
-    async def pull_policy_bundle(self) -> OrionYamlConfig:
-        """Fetch the workspace's declarative policy bundle from Orion Cloud."""
+    async def pull_policy_bundle_with_version(
+        self,
+        *,
+        environment: str | None = None,
+    ) -> tuple[OrionYamlConfig, int | None]:
+        """Fetch the workspace's declarative policy bundle and its Cloud version number."""
 
         if not self.api_key:
             raise ValueError("ORION_API_KEY is required to sync policies from Orion Cloud")
 
+        env = (
+            (environment or "").strip()
+            or os.getenv("ORION_ENVIRONMENT", "").strip()
+            or (self.config.cloud.environment if self.config is not None else "")
+            or "production"
+        )
         async with httpx.AsyncClient(
             base_url=self.endpoint,
             timeout=10.0,
@@ -310,16 +347,25 @@ class CloudTelemetrySyncClient:
         ) as client:
             response = await client.get(
                 "/v1/telemetry/policy-bundle",
+                params={"environment": env},
                 headers={"Authorization": f"Bearer {self.api_key}"},
             )
             response.raise_for_status()
             body: dict[str, Any] = response.json()
 
+        raw_version = body.get("policy_version")
+        policy_version = int(raw_version) if raw_version is not None else None
         yaml_dict = body.get("orion_yaml")
         if isinstance(yaml_dict, dict) and yaml_dict:
-            return parse_orion_yaml(yaml_dict, source_path="orion_cloud_bundle")
+            return parse_orion_yaml(yaml_dict, source_path="orion_cloud_bundle"), policy_version
         yaml_text = str(body.get("orion_yaml_text") or "")
-        return parse_orion_yaml(yaml_text, source_path="orion_cloud_bundle")
+        return parse_orion_yaml(yaml_text, source_path="orion_cloud_bundle"), policy_version
+
+    async def pull_policy_bundle(self, *, environment: str | None = None) -> OrionYamlConfig:
+        """Fetch the workspace's declarative policy bundle from Orion Cloud."""
+
+        cfg, _version = await self.pull_policy_bundle_with_version(environment=environment)
+        return cfg
 
 
 class GatewayControlPlaneAgent:
@@ -378,6 +424,7 @@ class GatewayControlPlaneAgent:
 
         name, node_key, environment, hostname = self._resolve_identity(cfg)
         sync_required = False
+        control_plane_reply: dict[str, Any] | None = None
 
         if self.gateway_id is None:
             reg = await client.register_gateway(
@@ -392,6 +439,7 @@ class GatewayControlPlaneAgent:
             if not reg or not reg.get("id"):
                 return False
             self.gateway_id = str(reg["id"])
+            control_plane_reply = reg
             sync_required = bool(reg.get("policy_drift"))
         else:
             hb = await client.send_heartbeat(
@@ -402,14 +450,19 @@ class GatewayControlPlaneAgent:
             )
             if not hb:
                 return False
+            control_plane_reply = hb
             sync_required = bool(hb.get("sync_required") or hb.get("policy_drift"))
 
         if sync_required and cfg.cloud.sync_policies:
             try:
-                pulled = await client.pull_policy_bundle()
+                pulled, pulled_version = await client.pull_policy_bundle_with_version(
+                    environment=environment
+                )
                 # Preserve local auth & cloud settings when hot-reloading policy rules from Cloud
                 merged = replace(pulled, auth=cfg.auth, cloud=cfg.cloud)
                 set_active_orion_yaml(merged)
+                if pulled_version is not None:
+                    self.active_policy_version = pulled_version
                 await client.send_heartbeat(
                     self.gateway_id,
                     active_policy_hash=merged.policy_hash,
@@ -417,7 +470,9 @@ class GatewayControlPlaneAgent:
                     hostname=hostname,
                 )
                 logger.info(
-                    "Hot-reloaded Orion Gate policy from Cloud (hash=%s)",
+                    "Hot-reloaded Orion Gate policy from Cloud (env=%s version=%s hash=%s)",
+                    environment,
+                    self.active_policy_version,
                     merged.policy_hash[:12],
                 )
                 return True
@@ -426,6 +481,13 @@ class GatewayControlPlaneAgent:
                     "Policy hot-reload from Orion Cloud failed; keeping current local policy",
                     exc_info=True,
                 )
+        elif (
+            not sync_required
+            and self.active_policy_version is None
+            and control_plane_reply is not None
+            and control_plane_reply.get("desired_policy_version") is not None
+        ):
+            self.active_policy_version = int(control_plane_reply["desired_policy_version"])
         return False
 
     async def run_forever(self) -> None:
